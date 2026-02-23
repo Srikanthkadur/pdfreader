@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import gc
 import re
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Iterable, List, TYPE_CHECKING
@@ -58,6 +59,37 @@ def meaningful(df: pd.DataFrame) -> bool:
     return non_empty >= 4
 
 
+def is_probably_garbled(df: pd.DataFrame) -> bool:
+    """Detect broken font-mapped extraction like '(cid:123)' payloads."""
+    values = df.values.tolist()
+    cells: list[str] = []
+    for row in values:
+        for value in row:
+            text = normalize_cell(value)
+            if text:
+                cells.append(text)
+
+    if not cells:
+        return True
+
+    joined = " ".join(cells[:500])
+    if re.search(r"\(cid:\d+\)", joined):
+        return True
+
+    # Garbage extraction often collapses the page into 1-2 giant cells.
+    avg_cell_len = sum(len(cell) for cell in cells) / len(cells)
+    max_cell_len = max(len(cell) for cell in cells)
+    if df.shape[1] <= 2 and (avg_cell_len > 45 or max_cell_len > 240):
+        return True
+
+    # Very low whitespace ratio usually means fused binary/glyph text.
+    spaces = joined.count(" ")
+    if len(joined) > 400 and spaces / max(1, len(joined)) < 0.04:
+        return True
+
+    return False
+
+
 def parse_end_token(token: str, total_pages: int) -> int:
     token = token.strip().lower()
     if token == "end":
@@ -104,11 +136,14 @@ def detect_total_pages(pdf_path: Path, password: str | None) -> int:
     return len(reader.pages)
 
 
-def extract_page_camelot(pdf_path: Path, page: int, password: str | None) -> List[pd.DataFrame]:
+def extract_page_camelot(
+    pdf_path: Path, page: int, password: str | None
+) -> tuple[List[pd.DataFrame], bool]:
     """Extract tables for a single page using Camelot."""
     import camelot
 
     out: List[pd.DataFrame] = []
+    saw_garbled = False
     for flavor in ("lattice", "stream"):
         try:
             tables = camelot.read_pdf(
@@ -124,17 +159,23 @@ def extract_page_camelot(pdf_path: Path, page: int, password: str | None) -> Lis
         for table in tables:
             df = normalize_df(table.df)
             if meaningful(df):
+                if is_probably_garbled(df):
+                    saw_garbled = True
+                    continue
                 out.append(df)
         if out:
             break
-    return out
+    return out, saw_garbled
 
 
-def extract_page_pdfplumber(pdf_path: Path, page: int, password: str | None) -> List[pd.DataFrame]:
+def extract_page_pdfplumber(
+    pdf_path: Path, page: int, password: str | None
+) -> tuple[List[pd.DataFrame], bool]:
     """Lightweight fallback extraction for a single page."""
     import pdfplumber
 
     out: List[pd.DataFrame] = []
+    saw_garbled = False
     table_settings_variants = (
         {
             "vertical_strategy": "lines",
@@ -161,9 +202,70 @@ def extract_page_pdfplumber(pdf_path: Path, page: int, password: str | None) -> 
                     continue
                 df = normalize_df(make_df(raw))
                 if meaningful(df):
+                    if is_probably_garbled(df):
+                        saw_garbled = True
+                        continue
                     out.append(df)
             if out:
                 break
+    return out, saw_garbled
+
+
+def render_page_to_png(pdf_path: Path, page: int, png_path: Path, dpi: int) -> None:
+    """Render a single PDF page to PNG with low memory overhead."""
+    import pypdfium2 as pdfium
+
+    pdf = None
+    pdf_page = None
+    bitmap = None
+    image = None
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        pdf_page = pdf[page - 1]
+        scale = max(1.0, dpi / 72.0)
+        bitmap = pdf_page.render(scale=scale)
+        image = bitmap.to_pil()
+        image.save(str(png_path))
+    finally:
+        if image is not None:
+            image.close()
+        if bitmap is not None and hasattr(bitmap, "close"):
+            bitmap.close()
+        if pdf_page is not None and hasattr(pdf_page, "close"):
+            pdf_page.close()
+        if pdf is not None and hasattr(pdf, "close"):
+            pdf.close()
+
+
+def extract_page_ocr(
+    pdf_path: Path,
+    page: int,
+    ocr_lang: str,
+    ocr_dpi: int,
+    ocr_min_confidence: int,
+) -> List[pd.DataFrame]:
+    """OCR fallback for pages with unreadable text-layer glyph mapping."""
+    from img2table.document import Image as Img2TableImage
+    from img2table.ocr import TesseractOCR
+
+    out: List[pd.DataFrame] = []
+    with tempfile.TemporaryDirectory(prefix="nitro_table_") as tmpdir:
+        image_path = Path(tmpdir) / f"page_{page:04d}.png"
+        render_page_to_png(pdf_path=pdf_path, page=page, png_path=image_path, dpi=ocr_dpi)
+
+        ocr = TesseractOCR(lang=ocr_lang, n_threads=1)
+        image_doc = Img2TableImage(src=str(image_path))
+        tables = image_doc.extract_tables(
+            ocr=ocr,
+            borderless_tables=True,
+            min_confidence=ocr_min_confidence,
+        )
+
+        for table in tables or []:
+            df = normalize_df(table.df)
+            if meaningful(df) and not is_probably_garbled(df):
+                out.append(df)
+
     return out
 
 
@@ -188,6 +290,9 @@ def run(
     method: str,
     fmt: str,
     password: str | None,
+    ocr_lang: str,
+    ocr_dpi: int,
+    ocr_min_confidence: int,
 ) -> None:
     total_pages = detect_total_pages(pdf_path, password=password)
     pages = parse_pages_spec(pages_spec, total_pages=total_pages)
@@ -200,13 +305,46 @@ def run(
 
     for page in iter_pages(pages):
         extracted: List[pd.DataFrame] = []
+        saw_garbled = False
         if method in {"auto", "camelot"}:
-            extracted = extract_page_camelot(pdf_path, page, password=password)
+            camelot_tables, camelot_garbled = extract_page_camelot(
+                pdf_path, page, password=password
+            )
+            extracted = camelot_tables
+            saw_garbled = saw_garbled or camelot_garbled
         if not extracted and method in {"auto", "pdfplumber"}:
-            extracted = extract_page_pdfplumber(pdf_path, page, password=password)
+            plumber_tables, plumber_garbled = extract_page_pdfplumber(
+                pdf_path, page, password=password
+            )
+            extracted = plumber_tables
+            saw_garbled = saw_garbled or plumber_garbled
+        if not extracted and method in {"auto", "ocr"}:
+            try:
+                extracted = extract_page_ocr(
+                    pdf_path=pdf_path,
+                    page=page,
+                    ocr_lang=ocr_lang,
+                    ocr_dpi=ocr_dpi,
+                    ocr_min_confidence=ocr_min_confidence,
+                )
+                if extracted:
+                    print(f"[INFO] Page {page}: OCR fallback used")
+            except ImportError as exc:
+                print(
+                    f"[WARN] Page {page}: OCR fallback unavailable ({exc}). "
+                    "Install: pip install img2table pypdfium2 pytesseract"
+                )
+            except Exception as exc:
+                print(f"[WARN] Page {page}: OCR fallback failed ({exc})")
 
         if not extracted:
-            print(f"[WARN] Page {page}: no table detected")
+            if saw_garbled:
+                print(
+                    f"[WARN] Page {page}: only garbled text-layer tables found; "
+                    "OCR did not return a usable table"
+                )
+            else:
+                print(f"[WARN] Page {page}: no table detected")
             continue
 
         for idx, df in enumerate(extracted, start=1):
@@ -225,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="out", help="Output directory")
     parser.add_argument(
         "--method",
-        choices=("auto", "camelot", "pdfplumber"),
+        choices=("auto", "camelot", "pdfplumber", "ocr"),
         default="auto",
         help="Extraction backend",
     )
@@ -236,6 +374,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output file format",
     )
     parser.add_argument("--password", default=None, help="PDF password (if encrypted)")
+    parser.add_argument("--ocr-lang", default="eng", help="Tesseract OCR language")
+    parser.add_argument(
+        "--ocr-dpi",
+        type=int,
+        default=150,
+        help="OCR render DPI (higher = slower but more accurate)",
+    )
+    parser.add_argument(
+        "--ocr-min-confidence",
+        type=int,
+        default=45,
+        help="Minimum OCR confidence for img2table",
+    )
     return parser
 
 
@@ -254,6 +405,9 @@ def main() -> int:
         method=args.method,
         fmt=args.format,
         password=args.password,
+        ocr_lang=args.ocr_lang,
+        ocr_dpi=args.ocr_dpi,
+        ocr_min_confidence=args.ocr_min_confidence,
     )
     return 0
 
