@@ -1,0 +1,5 @@
+camelot-py[cv]
+pdfplumber
+pandas
+pdf2image
+pytesseract
